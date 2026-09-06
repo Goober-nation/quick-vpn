@@ -15,23 +15,42 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Config (override via env vars before piping into bash)
+# Config — set as env vars before piping into bash to skip a prompt for that
+# value (e.g. PORT=8443 curl ... | bash). Anything left unset is prompted for
+# interactively below (leave the prompt blank to take the script's default).
 # ---------------------------------------------------------------------------
-PORT="${PORT:-10000}"                 # VLESS inbound port
-SNI="${SNI:-dzen.ru}"                 # Reality camouflage domain
-XHTTP_PATH="${XHTTP_PATH:-/xstream}"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
-
-SOCKS_PORT="${SOCKS_PORT:-1080}"
-SOCKS_USER="${SOCKS_USER:-user$(( RANDOM % 9000 + 1000 ))}"
-SOCKS_PASS="${SOCKS_PASS:-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)}"
 
 log()  { printf '\033[1;32m[+]\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$1"; }
 die()  { printf '\033[1;31m[x]\033[0m %s\n' "$1" >&2; exit 1; }
 
+# If the operator already had this config file (their own Xray/Dante setup
+# for something unrelated), preserve it instead of silently clobbering it.
+backup_if_exists() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    local bak="${f}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -p "$f" "$bak"
+    warn "Existing ${f} found — backed up to ${bak} before overwriting."
+  fi
+}
+
+# `[[ -r /dev/tty ]]` only checks permission bits and is a false positive
+# under e.g. `docker exec -T` (no PTY attached) — the device node exists and
+# looks readable, but actually opening it fails with ENXIO. Try the open for
+# real instead.
+have_tty() {
+  ( : < /dev/tty ) 2>/dev/null
+}
+
 [[ $EUID -eq 0 ]] || die "Run this as root (sudo -i, then re-run)."
 command -v systemctl >/dev/null || die "systemd required."
+
+# The whole script already runs as root (see check above), so none of the
+# apt-get/systemctl/ufw calls below need their own 'sudo' prefix — adding one
+# would just be redundant (root running sudo is a no-op, aside from the
+# unnecessary policy check).
 
 # ---------------------------------------------------------------------------
 # 0. Component selection
@@ -48,7 +67,7 @@ if [[ -n "${COMPONENTS:-}" ]]; then
       *) warn "Unknown component '$p' in COMPONENTS, ignoring." ;;
     esac
   done
-elif [[ -r /dev/tty ]]; then
+elif have_tty; then
   echo "Select what to install:"
   echo "  1) VLESS + Xray + XHTTP VPN only"
   echo "  2) Dante SOCKS5 proxy only"
@@ -67,6 +86,48 @@ else
 fi
 
 (( WANT_VLESS || WANT_SOCKS )) || die "Nothing selected, exiting."
+
+# ---------------------------------------------------------------------------
+# 0b. Interactive parameter prompts — only for values not already set via
+# env var, and only when a TTY is available (curl | bash still has one via
+# /dev/tty even though stdin is the pipe). Leaving a prompt blank keeps the
+# script's built-in default; running fully non-interactively (e.g. a cron'd
+# redeploy) just uses the defaults/env vars directly, no prompts shown.
+# ---------------------------------------------------------------------------
+prompt_var() {
+  # Always returns 0 — called as a bare statement, and under `set -e` a
+  # non-zero return from any of its early-outs (already set / no TTY) would
+  # otherwise kill the whole script right here.
+  local var_name="$1" prompt_text="$2" default_hint="$3"
+  if [[ -z "${!var_name:-}" ]] && have_tty; then
+    local input
+    read -rp "${prompt_text} [${default_hint}]: " input </dev/tty
+    [[ -n "$input" ]] && printf -v "$var_name" '%s' "$input"
+  fi
+  return 0
+}
+
+if (( WANT_VLESS )); then
+  prompt_var PORT "VLESS port" "default: 10000"
+  prompt_var SNI "Reality camouflage domain (SNI)" "default: addons.mozilla.org"
+  prompt_var XHTTP_PATH "XHTTP path" "default: /xstream"
+fi
+if (( WANT_SOCKS )); then
+  prompt_var SOCKS_PORT "SOCKS5 port" "default: 1080"
+  prompt_var SOCKS_USER "SOCKS5 username" "default: randomly generated"
+  prompt_var SOCKS_PASS "SOCKS5 password" "default: randomly generated"
+fi
+
+PORT="${PORT:-10000}"
+SNI="${SNI:-addons.mozilla.org}"
+XHTTP_PATH="${XHTTP_PATH:-/xstream}"
+SOCKS_PORT="${SOCKS_PORT:-1080}"
+SOCKS_USER="${SOCKS_USER:-user$(( RANDOM % 9000 + 1000 ))}"
+# The subshell's own `set +o pipefail` is needed because `head -c 20` closing
+# early sends tr a SIGPIPE (exit 141); under the outer `pipefail` + `set -e`
+# that would otherwise kill the whole script here, silently, before it prints
+# anything at all.
+SOCKS_PASS="${SOCKS_PASS:-$(set +o pipefail; tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)}"
 
 # ---------------------------------------------------------------------------
 # 1. Base packages
@@ -118,7 +179,7 @@ if (( IPV6_ONLY )); then
   echo "reach this server at all."
   if [[ -n "${CONFIRM_IPV6_ONLY:-}" ]]; then
     log "CONFIRM_IPV6_ONLY set, continuing without prompting."
-  elif [[ -r /dev/tty ]]; then
+  elif have_tty; then
     read -rp "Continue anyway? [y/N]: " ipv6_confirm </dev/tty
     case "$(echo "${ipv6_confirm:-}" | tr '[:upper:]' '[:lower:]')" in
       y|yes) log "Continuing with an IPv6-only address." ;;
@@ -161,10 +222,83 @@ Clients on the internet would not be able to reach this server.
 If this is intentional (e.g. local testing), set SERVER_IP=... and ALLOW_PRIVATE_IP=1."
 fi
 
-log "Ensuring firewall (ufw) is active..."
+# Only ever ADD allow-rules — never touch ufw's enabled/disabled state.
+# Flipping an inactive ufw to active switches its default policy to
+# deny-incoming, which would silently cut off any of the operator's other
+# services that were never firewalled because ufw was off. If they want
+# enforcement, that's their call to make explicitly, not this script's.
+log "Adding firewall rules (ufw)..."
 ufw allow 22/tcp >/dev/null 2>&1 || true
 if ufw status | grep -q "Status: inactive"; then
-  ufw --force enable >/dev/null 2>&1 || true
+  warn "ufw is currently inactive — rules were added but are not being enforced."
+  warn "Run 'ufw enable' yourself once you've confirmed no OTHER service on this box"
+  warn "needs a port that isn't yet allowed, or it will also get blocked."
+fi
+
+# ---------------------------------------------------------------------------
+# Per-component conflict detection: if this component's service is already
+# running, its config file already exists, or its port is already held by
+# something else, don't just barrel ahead — ask (or, non-interactively,
+# default to the safe choice: skip that component and leave it alone).
+# ---------------------------------------------------------------------------
+port_in_use_by() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -Hltnp "sport = :${port}" 2>/dev/null | head -1
+  fi
+}
+
+# Sets CONFLICT_REASON and returns 0 if a conflict was found for this
+# component, 1 if the coast is clear.
+detect_conflict() {
+  local service="$1" port="$2" config_file="$3"
+  if systemctl is-active --quiet "$service" 2>/dev/null; then
+    CONFLICT_REASON="the '${service}' service is already active on this VPS"
+    return 0
+  fi
+  if [[ -f "$config_file" ]]; then
+    CONFLICT_REASON="an existing ${config_file} was found on this VPS"
+    return 0
+  fi
+  local holder
+  holder="$(port_in_use_by "$port")"
+  if [[ -n "$holder" ]]; then
+    CONFLICT_REASON="port ${port} is already in use by another process:
+${holder}"
+    return 0
+  fi
+  return 1
+}
+
+# Returns 0 to proceed (install/overwrite this component), 1 to skip it.
+resolve_conflict() {
+  local label="$1" reason="$2" force_var="$3"
+  warn "${label}: ${reason}."
+  if [[ -n "${!force_var:-}" ]]; then
+    warn "${force_var} is set — proceeding with ${label} anyway (will overwrite the existing setup)."
+    return 0
+  fi
+  if have_tty; then
+    read -rp "Skip ${label} and leave the existing setup untouched? [Y/n]: " ans </dev/tty
+    case "$(echo "${ans:-y}" | tr '[:upper:]' '[:lower:]')" in
+      n|no) warn "Proceeding with ${label} — existing config (if any) will be backed up first."; return 0 ;;
+      *) log "Skipping ${label}."; return 1 ;;
+    esac
+  else
+    warn "No TTY to confirm — defaulting to SKIP ${label}."
+    warn "Re-run with ${force_var}=1 to force it non-interactively instead."
+    return 1
+  fi
+}
+
+SKIP_VLESS=0
+if (( WANT_VLESS )) && detect_conflict xray "$PORT" "$XRAY_CONFIG"; then
+  resolve_conflict "VLESS/Xray setup" "$CONFLICT_REASON" FORCE_VLESS || SKIP_VLESS=1
+fi
+
+SKIP_SOCKS=0
+if (( WANT_SOCKS )) && detect_conflict danted "$SOCKS_PORT" /etc/danted.conf; then
+  resolve_conflict "SOCKS5/Dante setup" "$CONFLICT_REASON" FORCE_SOCKS || SKIP_SOCKS=1
 fi
 
 # ---------------------------------------------------------------------------
@@ -191,6 +325,8 @@ install_vless() {
   [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" ]] || die "Could not parse keys from 'xray x25519' output:
 $KEY_OUTPUT"
   SHORT_ID="$(openssl rand -hex 8)"
+
+  backup_if_exists "$XRAY_CONFIG"
 
   log "Writing Xray config to ${XRAY_CONFIG}..."
   mkdir -p "$(dirname "$XRAY_CONFIG")"
@@ -272,6 +408,8 @@ install_socks() {
   iface="$(ip route show default | awk '/default/{print $5; exit}')"
   [[ -n "$iface" ]] || iface="eth0"
 
+  backup_if_exists /etc/danted.conf
+
   log "Writing /etc/danted.conf (external interface: ${iface})..."
   cat > /etc/danted.conf <<EOF
 logoutput: syslog
@@ -310,7 +448,19 @@ socks pass {
 }
 EOF
 
-  if ! id "$SOCKS_USER" &>/dev/null; then
+  if id "$SOCKS_USER" &>/dev/null; then
+    # This account already exists. Only touch its password if it looks like
+    # one this script created on a previous run (no login shell, no home
+    # dir) — otherwise this could be someone's real account, and silently
+    # resetting its password would be a serious surprise.
+    existing_shell="$(getent passwd "$SOCKS_USER" | cut -d: -f7)"
+    existing_home="$(getent passwd "$SOCKS_USER" | cut -d: -f6)"
+    if [[ "$existing_shell" != */nologin && "$existing_shell" != */false ]] || [[ -d "$existing_home" && "$existing_home" != "/" ]]; then
+      die "SOCKS_USER='${SOCKS_USER}' already exists as a real system account (shell: ${existing_shell}, home: ${existing_home}).
+Refusing to change its password. Pick a different SOCKS_USER=... instead."
+    fi
+    log "Reusing existing SOCKS user '${SOCKS_USER}' (created by a previous run of this script)."
+  else
     log "Creating system user '${SOCKS_USER}' for SOCKS auth..."
     useradd -M -N -s /usr/sbin/nologin "$SOCKS_USER"
   fi
@@ -329,8 +479,8 @@ EOF
 # ---------------------------------------------------------------------------
 # Run selected installs
 # ---------------------------------------------------------------------------
-(( WANT_VLESS )) && install_vless
-(( WANT_SOCKS )) && install_socks
+(( WANT_VLESS )) && (( ! SKIP_VLESS )) && install_vless
+(( WANT_SOCKS )) && (( ! SKIP_SOCKS )) && install_socks
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -340,7 +490,12 @@ echo "========================================================================"
 echo "  Setup complete on ${SERVER_IP}"
 echo "========================================================================"
 
-if (( WANT_VLESS )); then
+if (( WANT_VLESS )) && (( SKIP_VLESS )); then
+  echo
+  echo "--- VLESS + Reality + XHTTP VPN: SKIPPED (existing setup left untouched) ---"
+fi
+
+if (( WANT_VLESS )) && (( ! SKIP_VLESS )); then
   cat <<SUMMARY
 
 --- VLESS + Reality + XHTTP VPN ---
@@ -368,7 +523,12 @@ SUMMARY
   fi
 fi
 
-if (( WANT_SOCKS )); then
+if (( WANT_SOCKS )) && (( SKIP_SOCKS )); then
+  echo
+  echo "--- SOCKS5 Proxy: SKIPPED (existing setup left untouched) ---"
+fi
+
+if (( WANT_SOCKS )) && (( ! SKIP_SOCKS )); then
   socks_host="$SERVER_IP"
   if [[ "$socks_host" == *:* && "$socks_host" != \[*\] ]]; then
     socks_host="[${socks_host}]"
