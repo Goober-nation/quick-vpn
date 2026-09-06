@@ -81,10 +81,54 @@ apt-get install -y -qq qrencode >/dev/null 2>&1 || warn "Could not install qrenc
 
 # Public IP (used by both components). Override with SERVER_IP=... (e.g. for
 # LAN/docker testing where there is no real public IP to auto-detect).
+#
+# Tries several independent echo services per address family, so a single
+# provider being blocked/down/rate-limited (regional censorship, an outage,
+# etc.) can't be mistaken for "this host has no IPv4" — only concluding
+# IPv6-only once every IPv4 attempt has failed.
+IP_ECHO_SERVICES=(https://api.ipify.org https://ifconfig.me https://icanhazip.com https://ipv4.icanhazip.com)
+
+detect_ip() {
+  local family_flag="$1" url
+  for url in "${IP_ECHO_SERVICES[@]}"; do
+    local result
+    result="$(curl -fsSL "$family_flag" --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ -n "$result" ]] && { echo "$result"; return 0; }
+  done
+  return 1
+}
+
+IPV6_ONLY=0
 if [[ -z "${SERVER_IP:-}" ]]; then
-  SERVER_IP="$(curl -fsSL4 https://api.ipify.org || curl -fsSL https://ifconfig.me)"
+  if SERVER_IP="$(detect_ip -4)"; then
+    :
+  elif SERVER_IP="$(detect_ip -6)"; then
+    IPV6_ONLY=1
+  else
+    SERVER_IP=""
+  fi
 fi
-[[ -n "$SERVER_IP" ]] || die "Could not determine public IP (set SERVER_IP=... to override)."
+[[ -n "$SERVER_IP" ]] || die "Could not determine public IP after trying multiple providers over both IPv4 and IPv6
+(set SERVER_IP=... to override, e.g. if outbound access to these echo services is blocked)."
+
+if (( IPV6_ONLY )); then
+  warn "This server appears to have no public IPv4 address — only IPv6 (${SERVER_IP})."
+  echo "Clients on networks without IPv6 connectivity (still common on many home/office"
+  echo "Wi-Fi setups, though most mobile carriers do support it) will NOT be able to"
+  echo "reach this server at all."
+  if [[ -n "${CONFIRM_IPV6_ONLY:-}" ]]; then
+    log "CONFIRM_IPV6_ONLY set, continuing without prompting."
+  elif [[ -r /dev/tty ]]; then
+    read -rp "Continue anyway? [y/N]: " ipv6_confirm </dev/tty
+    case "$(echo "${ipv6_confirm:-}" | tr '[:upper:]' '[:lower:]')" in
+      y|yes) log "Continuing with an IPv6-only address." ;;
+      *) die "Aborted (server has no public IPv4 address)." ;;
+    esac
+  else
+    die "No TTY to confirm and CONFIRM_IPV6_ONLY not set — refusing to continue on an
+IPv6-only host non-interactively. Re-run with CONFIRM_IPV6_ONLY=1 to proceed anyway."
+  fi
+fi
 
 # Reject a private/reserved address unless explicitly allowed (e.g. local
 # docker/LAN testing with ALLOW_PRIVATE_IP=1) — clients on the internet can't
