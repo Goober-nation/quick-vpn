@@ -7,15 +7,23 @@
 #   - VLESS+Reality+XHTTP via a real xray client config built from the
 #     vless:// link the script prints, tunneled through a local SOCKS inbound
 #
-# Usage: ./docker/run-test.sh [--keep]
+# Usage: ./docker/run-test.sh [--keep] [--ipv6]
 #   --keep   leave the containers running afterwards for manual poking
+#   --ipv6   address the vps over its IPv6 address instead of its hostname,
+#            exercising the dual-stack listen/link-bracketing code paths
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 COMPOSE="docker compose -f docker/docker-compose.test.yml"
 KEEP=0
-[[ "${1:-}" == "--keep" ]] && KEEP=1
+USE_IPV6=0
+for arg in "$@"; do
+  case "$arg" in
+    --keep) KEEP=1 ;;
+    --ipv6) USE_IPV6=1 ;;
+  esac
+done
 
 SOCKS_USER="testuser"
 SOCKS_PASS="testpass123"
@@ -48,10 +56,18 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
-step "Running install.sh inside vps (COMPONENTS=vless,socks)"
+VPS_ADDR="vps"
+if [[ $USE_IPV6 -eq 1 ]]; then
+  step "Resolving vps's IPv6 address on the docker network"
+  VPS_ADDR="$(docker inspect auto-vpn-test-vps --format '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}')"
+  [[ -n "$VPS_ADDR" ]] || { echo "Could not find an IPv6 address for vps — check enable_ipv6 in docker-compose.test.yml"; exit 1; }
+  echo "  vps IPv6 address: ${VPS_ADDR}"
+fi
+
+step "Running install.sh inside vps (COMPONENTS=vless,socks, SERVER_IP=${VPS_ADDR})"
 INSTALL_LOG="$(mktemp)"
 $COMPOSE exec -T vps bash -c "
-  SERVER_IP=vps COMPONENTS=vless,socks SOCKS_USER=${SOCKS_USER} SOCKS_PASS=${SOCKS_PASS} /root/install.sh
+  SERVER_IP='${VPS_ADDR}' ALLOW_PRIVATE_IP=1 COMPONENTS=vless,socks SOCKS_USER=${SOCKS_USER} SOCKS_PASS=${SOCKS_PASS} /root/install.sh
 " | tee "$INSTALL_LOG"
 
 echo
@@ -68,15 +84,30 @@ else
   bad "danted.service is NOT active"
 fi
 
+# For the SOCKS5/curl reachability checks, addressing the vps container is
+# only interesting over its hostname or IPv4 (curl to a bare link-local-ish
+# ULA over docker's bridge works fine too) — reuse VPS_ADDR either way, but
+# curl needs brackets around a literal IPv6 host in a URL.
+CURL_HOST="$VPS_ADDR"
+if [[ $USE_IPV6 -eq 1 ]]; then
+  CURL_HOST="[${VPS_ADDR}]"
+fi
+
+# Force -4 in the default (non --ipv6) run: enabling IPv6 on the docker
+# network makes "vps" resolve to an AAAA record too, and that address isn't
+# NAT'd to the real internet without extra host config, unlike the IPv4 one.
+IP_FLAG="-4"
+[[ $USE_IPV6 -eq 1 ]] && IP_FLAG="-6"
+
 step "Testing SOCKS5 proxy from client container"
-if $COMPOSE exec -T client curl -s --max-time 8 -x "socks5h://${SOCKS_USER}:${SOCKS_PASS}@vps:1080" -o /dev/null -w '%{http_code}' https://ifconfig.me | grep -q 200; then
+if $COMPOSE exec -T client curl -s "$IP_FLAG" --max-time 8 -x "socks5h://${SOCKS_USER}:${SOCKS_PASS}@${CURL_HOST}:1080" -o /dev/null -w '%{http_code}' https://ifconfig.me | grep -q 200; then
   ok "SOCKS5 proxy relays traffic (authenticated) through vps"
 else
   bad "SOCKS5 proxy did not relay traffic"
 fi
 
 step "Confirming SOCKS5 rejects bad credentials"
-if $COMPOSE exec -T client curl -s --max-time 8 -x "socks5h://wrong:creds@vps:1080" -o /dev/null https://ifconfig.me; then
+if $COMPOSE exec -T client curl -s "$IP_FLAG" --max-time 8 -x "socks5h://wrong:creds@${CURL_HOST}:1080" -o /dev/null https://ifconfig.me; then
   bad "SOCKS5 accepted invalid credentials (should have failed)"
 else
   ok "SOCKS5 correctly rejects invalid credentials"
@@ -87,13 +118,19 @@ LINK="$(grep -m1 -o 'vless://.*' "$INSTALL_LOG" || true)"
 if [[ -z "$LINK" ]]; then
   bad "Could not find a vless:// link in install.sh output"
 else
-  # vless://UUID@HOST:PORT?query#tag
+  # vless://UUID@HOST:PORT?query#tag  (HOST is [bracketed] when it's IPv6)
   body="${LINK#vless://}"
   UUID="${body%%@*}"
   rest="${body#*@}"
   hostport="${rest%%\?*}"
-  HOST="${hostport%%:*}"
-  PORT="${hostport##*:}"
+  if [[ "$hostport" == \[*\]:* ]]; then
+    HOST="${hostport#\[}"
+    HOST="${HOST%%\]:*}"
+    PORT="${hostport##*\]:}"
+  else
+    HOST="${hostport%%:*}"
+    PORT="${hostport##*:}"
+  fi
   query="${rest#*\?}"
   query="${query%%#*}"
 
@@ -103,6 +140,10 @@ else
   SNI="$(get_param sni)"
   PATHRAW="$(get_param path)"
   XPATH="$(python3 -c "import urllib.parse,sys;print(urllib.parse.unquote(sys.argv[1]))" "$PATHRAW" 2>/dev/null || echo "$PATHRAW")"
+
+  if [[ $USE_IPV6 -eq 1 && "$HOST" != "$VPS_ADDR" ]]; then
+    bad "Link host '${HOST}' did not match expected IPv6 address '${VPS_ADDR}' (bracket parsing/bug?)"
+  fi
 
   CLIENT_CFG="$(mktemp)"
   cat > "$CLIENT_CFG" <<EOF

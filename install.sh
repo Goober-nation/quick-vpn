@@ -21,8 +21,6 @@ PORT="${PORT:-10000}"                 # VLESS inbound port
 SNI="${SNI:-dzen.ru}"                 # Reality camouflage domain
 XHTTP_PATH="${XHTTP_PATH:-/xstream}"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
-SUB_DIR="/var/www/html"
-SUB_FILE="${SUB_DIR}/sub.json"
 
 SOCKS_PORT="${SOCKS_PORT:-1080}"
 SOCKS_USER="${SOCKS_USER:-user$(( RANDOM % 9000 + 1000 ))}"
@@ -77,6 +75,9 @@ log "Updating apt and installing prerequisites..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq curl jq uuid-runtime ufw ca-certificates openssl >/dev/null
+# Best-effort: used to print a scannable QR code for the vless:// link at the
+# end. Not fatal if unavailable (e.g. package missing on this release/mirror).
+apt-get install -y -qq qrencode >/dev/null 2>&1 || warn "Could not install qrencode — QR code will be skipped."
 
 # Public IP (used by both components). Override with SERVER_IP=... (e.g. for
 # LAN/docker testing where there is no real public IP to auto-detect).
@@ -84,6 +85,37 @@ if [[ -z "${SERVER_IP:-}" ]]; then
   SERVER_IP="$(curl -fsSL4 https://api.ipify.org || curl -fsSL https://ifconfig.me)"
 fi
 [[ -n "$SERVER_IP" ]] || die "Could not determine public IP (set SERVER_IP=... to override)."
+
+# Reject a private/reserved address unless explicitly allowed (e.g. local
+# docker/LAN testing with ALLOW_PRIVATE_IP=1) — clients on the internet can't
+# reach the VPS if the printed link points at a non-routable address.
+is_private_ip() {
+  local ip="$1"
+  if [[ "$ip" == *.*.*.* ]]; then
+    case "$ip" in
+      10.*|127.*|169.254.*) return 0 ;;
+      192.168.*) return 0 ;;
+      172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+      100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;;
+      0.*) return 0 ;;
+    esac
+    return 1
+  else
+    # IPv6: loopback, link-local (fe80::/10), unique local (fc00::/7)
+    local ip_lc
+    ip_lc="$(echo "$ip" | tr '[:upper:]' '[:lower:]')"
+    case "$ip_lc" in
+      ::1|fe80:*|fc*|fd*) return 0 ;;
+    esac
+    return 1
+  fi
+}
+
+if [[ -z "${ALLOW_PRIVATE_IP:-}" ]] && is_private_ip "$SERVER_IP"; then
+  die "Detected address '${SERVER_IP}' is private/non-routable, not a public IP.
+Clients on the internet would not be able to reach this server.
+If this is intentional (e.g. local testing), set SERVER_IP=... and ALLOW_PRIVATE_IP=1."
+fi
 
 log "Ensuring firewall (ufw) is active..."
 ufw allow 22/tcp >/dev/null 2>&1 || true
@@ -123,7 +155,7 @@ $KEY_OUTPUT"
   "log": { "loglevel": "warning" },
   "inbounds": [
     {
-      "listen": "0.0.0.0",
+      "listen": "::",
       "port": ${PORT},
       "protocol": "vless",
       "tag": "xhttp-in",
@@ -172,16 +204,16 @@ EOF
   local enc_path
   enc_path="$(urlencode_path "$XHTTP_PATH")"
 
-  LINK_STREAM_ONE="$(printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&mode=stream-one&path=%s#XHTTP-Stream-One\n' \
-    "$CLIENT_UUID" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$enc_path")"
-  LINK_PACKET_UP="$(printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&mode=packet-up&path=%s#XHTTP-Packet-Up\n' \
-    "$CLIENT_UUID" "$SERVER_IP" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$enc_path")"
-
-  if [[ -d "$SUB_DIR" ]]; then
-    log "Writing subscription file to ${SUB_FILE}..."
-    { printf '%s\n%s\n' "$LINK_STREAM_ONE" "$LINK_PACKET_UP"; } | base64 -w0 > "$SUB_FILE" 2>/dev/null || \
-    { printf '%s\n%s\n' "$LINK_STREAM_ONE" "$LINK_PACKET_UP"; } | base64 > "$SUB_FILE"
+  # Bracket bare IPv6 addresses (containing ':' and not already bracketed) per RFC 3986.
+  local link_host="$SERVER_IP"
+  if [[ "$link_host" == *:* && "$link_host" != \[*\] ]]; then
+    link_host="[${link_host}]"
   fi
+
+  LINK_STREAM_ONE="$(printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&mode=stream-one&path=%s#XHTTP-Stream-One\n' \
+    "$CLIENT_UUID" "$link_host" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$enc_path")"
+  LINK_PACKET_UP="$(printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&mode=packet-up&path=%s#XHTTP-Packet-Up\n' \
+    "$CLIENT_UUID" "$link_host" "$PORT" "$SNI" "$PUBLIC_KEY" "$SHORT_ID" "$enc_path")"
 }
 
 # ---------------------------------------------------------------------------
@@ -201,6 +233,7 @@ install_socks() {
 logoutput: syslog
 
 internal: 0.0.0.0 port = ${SOCKS_PORT}
+internal: :: port = ${SOCKS_PORT}
 external: ${iface}
 
 clientmethod: none
@@ -214,9 +247,19 @@ client pass {
     from: 0.0.0.0/0 to: 0.0.0.0/0
     log: error
 }
+client pass {
+    from: ::/0 to: ::/0
+    log: error
+}
 
 socks pass {
     from: 0.0.0.0/0 to: 0.0.0.0/0
+    command: bind connect udpassociate
+    log: error
+    socksmethod: username
+}
+socks pass {
+    from: ::/0 to: ::/0
     command: bind connect udpassociate
     log: error
     socksmethod: username
@@ -264,7 +307,6 @@ Import either link into Happ, v2rayTun, v2rayNG, or NekoBox:
   ${LINK_PACKET_UP}
 
 Config file: ${XRAY_CONFIG}
-$( [[ -f "$SUB_FILE" ]] && echo "Subscription (base64): http://${SERVER_IP}/sub.json" )
 
 UUID:        ${CLIENT_UUID}
 Public key:  ${PUBLIC_KEY}
@@ -273,9 +315,20 @@ SNI:         ${SNI}
 
 Manage with: systemctl {status,restart,stop} xray
 SUMMARY
+
+  if command -v qrencode >/dev/null 2>&1; then
+    echo "Scan to import (XHTTP-Stream-One) in Happ / v2rayTun / v2rayNG / NekoBox:"
+    echo
+    qrencode -t ansiutf8 -m 2 "$LINK_STREAM_ONE"
+    echo
+  fi
 fi
 
 if (( WANT_SOCKS )); then
+  socks_host="$SERVER_IP"
+  if [[ "$socks_host" == *:* && "$socks_host" != \[*\] ]]; then
+    socks_host="[${socks_host}]"
+  fi
   cat <<SUMMARY
 
 --- SOCKS5 Proxy ---
@@ -285,7 +338,7 @@ Username:  ${SOCKS_USER}
 Password:  ${SOCKS_PASS}
 
 Use in a browser/app SOCKS5 setting, or test from a shell with:
-  curl -x socks5h://${SOCKS_USER}:${SOCKS_PASS}@${SERVER_IP}:${SOCKS_PORT} https://ifconfig.me
+  curl -x socks5h://${SOCKS_USER}:${SOCKS_PASS}@${socks_host}:${SOCKS_PORT} https://ifconfig.me
 
 Manage with: systemctl {status,restart,stop} danted
 SUMMARY
