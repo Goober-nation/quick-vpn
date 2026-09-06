@@ -1,0 +1,29 @@
+services:
+  vps:
+    build:
+      context: ..
+      dockerfile: docker/vps.Dockerfile
+    container_name: auto-vpn-test-vps
+    privileged: true
+    cgroup: host
+    tmpfs:
+      - /run
+      - /run/lock
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    networks:
+      - vpnnet
+
+  client:
+    build:
+      context: ..
+      dockerfile: docker/client.Dockerfile
+    container_name: auto-vpn-test-client
+    depends_on:
+      - vps
+    networks:
+      - vpnnet
+
+networks:
+  vpnnet:
+    driver: bridge
